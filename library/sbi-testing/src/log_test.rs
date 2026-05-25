@@ -130,6 +130,13 @@ impl Testing {
                     debug!(target: TARGET, "hart {id} suspended retentive")
                 }
                 HartStopped(id) => debug!(target: TARGET, "hart {id} stopped"),
+                RemoteRFencePass(id) => {
+                    info!(target: TARGET, "remote RFence to started hart {id} pass")
+                }
+                RemoteRFenceFailed(id, ret) => {
+                    error!(target: TARGET, "remote RFence to started hart {id} failed: {ret:?}");
+                    result = false;
+                }
                 BatchPass(batch) => info!(target: TARGET, "Testing Pass: {batch:?}"),
             }
         });
@@ -158,6 +165,26 @@ impl Testing {
                 Read(len) => info!(target: TARGET, "reading {len} bytes from console"),
                 ReadingFailed(ret) => {
                     error!(target: TARGET, "reading failed: {ret:?}");
+                    result = false;
+                }
+                NonzeroUpperWriteRejected(ret) => {
+                    info!(target: TARGET, "DBCN rejected non-zero upper-half write: {ret:?}");
+                }
+                NonzeroUpperWriteAccepted(len) => {
+                    error!(
+                        target: TARGET,
+                        "DBCN accepted non-zero upper-half write: {len} bytes written"
+                    );
+                    result = false;
+                }
+                NonzeroUpperReadRejected(ret) => {
+                    info!(target: TARGET, "DBCN rejected non-zero upper-half read: {ret:?}");
+                }
+                NonzeroUpperReadAccepted(len) => {
+                    error!(
+                        target: TARGET,
+                        "DBCN accepted non-zero upper-half read: {len} bytes read"
+                    );
                     result = false;
                 }
             }

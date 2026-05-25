@@ -106,13 +106,11 @@ impl UartBflbWrap {
 impl ConsoleDevice for UartBflbWrap {
     fn read(&self, buf: &mut [u8]) -> usize {
         let uart = unsafe { &(*self.inner) };
-        while uart.fifo_config_1.read().receive_available_bytes() == 0 {
-            core::hint::spin_loop();
+        let rx_available = uart.fifo_config_1.read().receive_available_bytes() as usize;
+        if rx_available == 0 {
+            return 0;
         }
-        let len = core::cmp::min(
-            uart.fifo_config_1.read().receive_available_bytes() as usize,
-            buf.len(),
-        );
+        let len = core::cmp::min(rx_available, buf.len());
         buf.iter_mut()
             .take(len)
             .for_each(|slot| *slot = uart.fifo_read.read());
@@ -161,10 +159,6 @@ impl UartPl011Wrap {
             uart: UnsafeCell::new(uart),
         }
     }
-
-    unsafe fn uart_mut(&self) -> &mut Uart<'static> {
-        unsafe { &mut *self.uart.get() }
-    }
 }
 
 unsafe impl Send for UartPl011Wrap {}
@@ -174,7 +168,7 @@ impl ConsoleDevice for UartPl011Wrap {
     fn read(&self, buf: &mut [u8]) -> usize {
         let mut count = 0;
 
-        let uart = unsafe { self.uart_mut() };
+        let uart = unsafe { &mut *self.uart.get() };
 
         for slot in buf.iter_mut() {
             match uart.read_word() {
@@ -191,7 +185,7 @@ impl ConsoleDevice for UartPl011Wrap {
     }
 
     fn write(&self, buf: &[u8]) -> usize {
-        let uart = unsafe { self.uart_mut() };
+        let uart = unsafe { &mut *self.uart.get() };
 
         for &byte in buf {
             uart.write_word(byte);

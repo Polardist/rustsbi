@@ -8,6 +8,7 @@ use crate::platform::PLATFORM;
 use crate::riscv::csr::{CSR_TIME, CSR_TIMEH};
 use crate::riscv::current_hartid;
 use crate::sbi::console;
+use crate::sbi::features::{Extension, hart_extension_probe};
 use crate::sbi::hsm::local_hsm;
 use crate::sbi::ipi;
 use crate::sbi::pmu::pmu_firmware_counter_increment;
@@ -16,10 +17,28 @@ use crate::sbi::rfence;
 use super::helper::*;
 
 #[inline]
+fn enable_mtimer_if_no_sstc() {
+    if !hart_extension_probe(current_hartid(), Extension::Sstc) {
+        unsafe {
+            mie::set_mtimer();
+        }
+    }
+}
+
+#[inline]
 pub fn switch(mut ctx: FastContext, start_addr: usize, opaque: usize) -> FastResult {
     unsafe {
+        // stvec BASE is four-byte aligned; HSM entry points may only be two-byte aligned.
+        if start_addr & 0x3 == 0 {
+            core::arch::asm!(
+                "csrw stvec, {start_addr}",
+                start_addr = in(reg) start_addr,
+                options(nomem),
+            );
+        }
+        core::arch::asm!("csrw sscratch, zero", "csrw sie, zero", options(nomem),);
         sstatus::clear_sie();
-        satp::write(0);
+        satp::write(satp::Satp::from_bits(0));
     }
 
     ctx.regs().a[0] = current_hartid();
@@ -28,20 +47,17 @@ pub fn switch(mut ctx: FastContext, start_addr: usize, opaque: usize) -> FastRes
     ctx.call(2)
 }
 
-/// Handle machine software inter-processor interrupts.
 #[inline]
 pub fn msoft_ipi_handler() {
     use ipi::get_and_reset_ipi_type;
-    ipi::clear_msip();
+    ipi::claim_ipi();
     let ipi_type = get_and_reset_ipi_type();
-    // Handle supervisor software interrupt
     if (ipi_type & ipi::IPI_TYPE_SSOFT) != 0 {
         pmu_firmware_counter_increment(firmware_event::IPI_RECEIVED);
         unsafe {
             riscv::register::mip::set_ssoft();
         }
     }
-    // Handle fence operation
     if (ipi_type & ipi::IPI_TYPE_FENCE) != 0 {
         rfence::rfence_handler();
     }
@@ -50,32 +66,89 @@ pub fn msoft_ipi_handler() {
 #[inline]
 pub fn msoft_handler(ctx: FastContext) -> FastResult {
     match local_hsm().start() {
-        // Handle HSM Start
         Ok(next_stage) => {
-            ipi::clear_msip();
+            ipi::claim_ipi();
             unsafe {
                 mstatus::set_mpie();
                 mstatus::set_mpp(next_stage.next_mode);
                 mie::set_msoft();
-                mie::set_mtimer();
             }
+            enable_mtimer_if_no_sstc();
             switch(ctx, next_stage.start_addr, next_stage.opaque)
         }
-        // Handle HSM Stop
         Err(rustsbi::spec::hsm::HART_STOP) => {
-            ipi::clear_msip();
+            ipi::claim_ipi();
             unsafe {
                 mie::set_msoft();
             }
             riscv::asm::wfi();
             ctx.restore()
         }
-        // Handle IPI and RFence
         _ => {
             msoft_ipi_handler();
             ctx.restore()
         }
     }
+}
+
+#[inline]
+pub fn mext_handler(ctx: FastContext) -> FastResult {
+    use ipi::get_and_reset_ipi_type;
+
+    if !crate::platform::aia::is_aia_active()
+        || !hart_extension_probe(current_hartid(), Extension::Smaia)
+    {
+        warn!("MachineExternal: AIA is not available on this hart");
+        return ctx.restore();
+    }
+
+    let Some(firmware_ipi_iid) =
+        (unsafe { PLATFORM.info.aia.as_ref().map(|a| a.firmware_ipi_iid) })
+    else {
+        warn!("MachineExternal: missing AIA platform info");
+        return ctx.restore();
+    };
+
+    let iid = crate::platform::aia::mtopei_claim();
+
+    match iid {
+        Some(id) if firmware_ipi_iid == id => match local_hsm().start() {
+            Ok(next_stage) => {
+                unsafe {
+                    mstatus::set_mpie();
+                    mstatus::set_mpp(next_stage.next_mode);
+                    mie::set_msoft();
+                    mie::set_mext();
+                }
+                enable_mtimer_if_no_sstc();
+                return switch(ctx, next_stage.start_addr, next_stage.opaque);
+            }
+            Err(rustsbi::spec::hsm::HART_STOP) => {
+                unsafe {
+                    mie::set_mext();
+                }
+                riscv::asm::wfi();
+                return ctx.restore();
+            }
+            _ => {
+                let ipi_type = get_and_reset_ipi_type();
+                if (ipi_type & ipi::IPI_TYPE_SSOFT) != 0 {
+                    pmu_firmware_counter_increment(firmware_event::IPI_RECEIVED);
+                    unsafe {
+                        riscv::register::mip::set_ssoft();
+                    }
+                }
+                if (ipi_type & ipi::IPI_TYPE_FENCE) != 0 {
+                    rfence::rfence_handler();
+                }
+            }
+        },
+        Some(id) => {
+            warn!("MachineExternal: unexpected IID {}", id.number());
+        }
+        None => {}
+    }
+    ctx.restore()
 }
 
 #[inline]
@@ -98,25 +171,31 @@ pub fn sbi_call_handler(
     };
     if ret.is_ok() {
         match (a7, a6) {
-            // Handle non-retentive suspend
             (hsm::EID_HSM, hsm::HART_SUSPEND)
                 if matches!(ctx.a0() as u32, hsm::suspend_type::NON_RETENTIVE) =>
             {
                 return switch(ctx, a1, a2);
             }
-            // Handle legacy console probe
-            (base::EID_BASE, base::PROBE_EXTENSION)
-                if matches!(
-                    ctx.a0(),
-                    legacy::LEGACY_CONSOLE_PUTCHAR | legacy::LEGACY_CONSOLE_GETCHAR
-                ) =>
-            {
-                ret.value = 1;
-            }
+            (base::EID_BASE, base::PROBE_EXTENSION) => match ctx.a0() {
+                legacy::LEGACY_SET_TIMER => {
+                    ret.value = unsafe { PLATFORM.sbi.ipi.is_some() } as usize;
+                }
+                legacy::LEGACY_CONSOLE_PUTCHAR | legacy::LEGACY_CONSOLE_GETCHAR => {
+                    ret.value = 1;
+                }
+                _ => {}
+            },
             _ => {}
         }
     } else {
         match a7 {
+            legacy::LEGACY_SET_TIMER => {
+                if let Some(ipi) = unsafe { PLATFORM.sbi.ipi.as_ref() } {
+                    rustsbi::Timer::set_timer(ipi, ctx.a0() as u64);
+                    ret.error = 0;
+                    ret.value = a1;
+                }
+            }
             legacy::LEGACY_CONSOLE_PUTCHAR => {
                 ret.error = console::putchar(ctx.a0());
                 ret.value = a1;
@@ -130,17 +209,16 @@ pub fn sbi_call_handler(
     }
     ctx.regs().a = [ret.error, ret.value, a2, a3, a4, a5, a6, a7];
     let epc = mepc::read();
-    mepc::write(epc + get_inst(epc).1);
+    unsafe { mepc::write(epc + get_inst(epc).1) };
     ctx.restore()
 }
 
-/// Delegate trap handling to supervisor mode.
 #[inline]
 pub fn delegate(ctx: &mut EntireContextSeparated) {
     use riscv::register::{mcause, scause, sepc, sstatus, stval, stvec};
     unsafe {
         sepc::write(ctx.regs().pc);
-        scause::write(mcause::read().bits());
+        scause::write(scause::Scause::from_bits(mcause::read().bits()));
         stval::write(mtval::read());
         sstatus::clear_sie();
         if mstatus::read().mpp() == mstatus::MPP::Supervisor {
@@ -153,7 +231,6 @@ pub fn delegate(ctx: &mut EntireContextSeparated) {
     }
 }
 
-/// Handle illegal instructions, particularly CSR access.
 #[inline]
 pub extern "C" fn illegal_instruction_handler(raw_ctx: EntireContext) -> EntireResult {
     let mut ctx = raw_ctx.split().0;
@@ -186,7 +263,9 @@ pub extern "C" fn illegal_instruction_handler(raw_ctx: EntireContext) -> EntireR
         }
     }
     let epc = mepc::read();
-    mepc::write(epc + get_inst(epc).1);
+    unsafe {
+        mepc::write(epc + get_inst(epc).1);
+    }
     ctx.restore()
 }
 
@@ -203,8 +282,6 @@ pub extern "C" fn load_misaligned_handler(ctx: EntireContext) -> EntireResult {
     );
     let decode_result = decode(current_inst as u32);
 
-    // TODO: INST FLD c.*sp
-    // TODO: maybe can we reduce the time to update csr for read virtual-address.
     let inst_type = match decode_result {
         Ok(Instruction::Lb(data)) => (data.rd(), VarType::Signed, 1),
         Ok(Instruction::Lbu(data)) => (data.rd(), VarType::UnSigned, 1),
@@ -247,7 +324,9 @@ pub extern "C" fn load_misaligned_handler(ctx: EntireContext) -> EntireResult {
         VarType::Signed | VarType::UnSigned => save_reg_x(&mut ctx, target_reg as usize, read_data),
         VarType::Float => set_reg_f(target_reg as usize, len, read_data),
     };
-    mepc::write(current_pc + inst_len);
+    unsafe {
+        mepc::write(current_pc + inst_len);
+    }
     ctx.restore()
 }
 
@@ -265,8 +344,6 @@ pub extern "C" fn store_misaligned_handler(ctx: EntireContext) -> EntireResult {
 
     let decode_result = decode(current_inst as u32);
 
-    // TODO: INST FSD c.*sp
-    // TODO: maybe can we reduce the time to update csr for read virtual-address.
     let inst_type = match decode_result {
         Ok(Instruction::Sb(data)) => (data.rs2(), VarType::UnSigned, 1),
         Ok(Instruction::Sh(data)) => (data.rs2(), VarType::UnSigned, 2),
@@ -307,6 +384,8 @@ pub extern "C" fn store_misaligned_handler(ctx: EntireContext) -> EntireResult {
         save_byte(current_addr + i, read_data[i] as usize);
     }
 
-    mepc::write(current_pc + inst_len);
+    unsafe {
+        mepc::write(current_pc + inst_len);
+    }
     ctx.restore()
 }

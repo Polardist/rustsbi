@@ -9,6 +9,18 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+### Modified
+
+### Fixed
+
+- lib: update dependency version of `rustsbi` to 0.4.1
+
+### Removed
+
+## [0.4.1] - 2026-05-13
+
+### Added
+
 - ci: add `check-changelog` and `check-commit-signatures` in `workflows`.
 - pmu: add missing `snapshot_set_shmem` function and testcases in `Pmu` trait.
 - pmu: add missing `snapshot_set_shmem` function in `Pmu` trait, impl for `&T` and `Option<T>` and `Forward` structure
@@ -19,14 +31,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Modified
 
 - Migrate sbi-rt crate to Rust 2024 edition.
+- Upgrade dependency `riscv` to 0.16.0.
 - susp: amend documentation on `system_suspend` function.
 - lib: replace map+unwrap_or with Option::map_or in impls
 - doc: lib: alter link to Prototyper firmware in documentation.
 - doc: lib: clarify error codes in documents of SBI IPI and RFENCE extensions
 - doc: rustsbi: update `#[naked]` in docs to `#[unsafe(naked)]`
-
-### Removed
-
 
 ### Fixed
 

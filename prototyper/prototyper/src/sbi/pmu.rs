@@ -266,11 +266,10 @@ impl Pmu for SbiPmu {
             pmu_state.active_event[counter_idx] = event_idx;
         }
 
-        if configure_counter(pmu_state, counter_idx, event, flags) {
-            return SbiRet::success(counter_idx);
+        match configure_counter(pmu_state, counter_idx, event, flags) {
+            Ok(_) => SbiRet::success(counter_idx),
+            Err(e) => e,
         }
-
-        return SbiRet::not_supported();
     }
 
     /// Start one or more counters (FID #3)
@@ -592,7 +591,7 @@ impl SbiPmu {
     pub fn insert_event_to_mhpmcounter(&mut self, event_to_counter: EventToCounterMap) {
         let event_to_mhpmcounter_map = self.event_to_mhpmcounter.get_or_insert_default();
         for event_to_mhpmcounter in event_to_mhpmcounter_map.iter() {
-            if event_to_mhpmcounter.is_overlop(&event_to_counter) {
+            if event_to_mhpmcounter.is_overlap(&event_to_counter) {
                 error!(
                     "The mapping of event_to_mhpmcounter {:?} and {:?} overlap, please check the device tree file",
                     event_to_mhpmcounter, event_to_counter
@@ -606,7 +605,7 @@ impl SbiPmu {
     pub fn insert_raw_event_to_mhpmcounter(&mut self, raw_event_to_counter: RawEventToCounterMap) {
         let raw_event_to_mhpmcounter_map = self.raw_event_to_mhpmcounter.get_or_insert_default();
         for raw_event_to_mhpmcounter in raw_event_to_mhpmcounter_map.iter() {
-            if raw_event_to_mhpmcounter.is_overlop(&raw_event_to_counter) {
+            if raw_event_to_mhpmcounter.is_overlap(&raw_event_to_counter) {
                 error!(
                     "The mapping of raw_event_to_mhpmcounter {:?} and {:?} overlap, please check the device tree file",
                     raw_event_to_mhpmcounter, raw_event_to_counter
@@ -627,11 +626,14 @@ fn configure_counter(
     counter_idx: usize,
     event: EventIdx,
     flags: flags::CounterCfgFlags,
-) -> bool {
+) -> Result<(), SbiRet> {
     let auto_start = flags.contains(flags::CounterCfgFlags::AUTO_START);
     let clear_value = flags.contains(flags::CounterCfgFlags::CLEAR_VALUE);
     if event.is_firmware_event() {
         let firmware_event_idx = counter_idx - pmu_state.hw_counters_num;
+        if firmware_event_idx >= PMU_FIRMWARE_COUNTER_MAX {
+            return Err(SbiRet::invalid_param());
+        }
         if clear_value {
             pmu_state.fw_counter[firmware_event_idx] = 0;
         }
@@ -644,10 +646,12 @@ fn configure_counter(
             write_mhpmcounter(mhpm_offset, 0);
         }
         if auto_start {
-            return start_hardware_counter(mhpm_offset, 0, false).is_ok();
+            if start_hardware_counter(mhpm_offset, 0, false).is_err() {
+                return Err(SbiRet::not_supported());
+            }
         }
     }
-    true
+    Ok(())
 }
 
 /// Get the offset of the mhpmcounter CSR corresponding to counter_idx relative to mcycle
@@ -671,15 +675,81 @@ enum StartCounterErr {
     AlreadyStart,
 }
 
+#[derive(Clone, Copy)]
+enum HardwareCounter {
+    Cycle,
+    Instret,
+    Hpm(u16),
+}
+
+impl HardwareCounter {
+    #[inline]
+    fn try_from_offset(mhpm_offset: u16) -> Option<Self> {
+        match mhpm_offset {
+            0 => Some(Self::Cycle),
+            2 => Some(Self::Instret),
+            3..=31 => Some(Self::Hpm(mhpm_offset)),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn inhibit_mask(self) -> usize {
+        match self {
+            Self::Cycle => 1 << 0,
+            Self::Instret => 1 << 2,
+            Self::Hpm(offset) => 1 << offset,
+        }
+    }
+
+    #[inline]
+    unsafe fn start(self) {
+        match self {
+            Self::Cycle => unsafe { mcountinhibit::clear_cy() },
+            Self::Instret => unsafe { mcountinhibit::clear_ir() },
+            Self::Hpm(offset) => unsafe { mcountinhibit::clear_hpm(offset as usize) },
+        }
+        self.sync_shadow();
+    }
+
+    #[inline]
+    unsafe fn stop(self) {
+        match self {
+            Self::Cycle => unsafe { mcountinhibit::set_cy() },
+            Self::Instret => unsafe { mcountinhibit::set_ir() },
+            Self::Hpm(offset) => unsafe { mcountinhibit::set_hpm(offset as usize) },
+        }
+        self.sync_shadow();
+    }
+
+    #[inline]
+    fn sync_shadow(self) {
+        match self {
+            Self::Cycle => {
+                // `cycle` is the S/U-mode shadow of `mcycle`. Force a machine-level
+                // read after toggling CY so the shadowed counter state is observed
+                // consistently on QEMU before returning to lower privilege modes.
+                let _ = riscv::register::mcycle::read64();
+            }
+            Self::Instret => {
+                // `instret` is the S/U-mode shadow of `minstret`; keep its shadow
+                // state in sync for the same reason as `cycle`.
+                let _ = riscv::register::minstret::read64();
+            }
+            Self::Hpm(_) => {}
+        }
+    }
+}
+
 /// Starts a hardware performance counter specified by the offset.
 fn start_hardware_counter(
     mhpm_offset: u16,
     new_value: u64,
     is_update_value: bool,
 ) -> Result<(), StartCounterErr> {
-    if mhpm_offset == 1 || mhpm_offset > 31 {
+    let Some(counter) = HardwareCounter::try_from_offset(mhpm_offset) else {
         return Err(StartCounterErr::OffsetInvalid);
-    }
+    };
 
     if hart_privileged_version(current_hartid()) < PrivilegedVersion::Version1_11 {
         if is_update_value {
@@ -690,7 +760,7 @@ fn start_hardware_counter(
 
     // Check if counter is already running by testing the inhibit bit
     // A zero bit in mcountinhibit means the counter is running
-    if mcountinhibit::read().bits() & (1 << mhpm_offset) == 0 {
+    if mcountinhibit::read().bits() & counter.inhibit_mask() == 0 {
         return Err(StartCounterErr::AlreadyStart);
     }
 
@@ -699,11 +769,7 @@ fn start_hardware_counter(
     }
 
     unsafe {
-        match mhpm_offset {
-            0 => mcountinhibit::clear_cy(),
-            2 => mcountinhibit::clear_ir(),
-            _ => mcountinhibit::clear_hpm(mhpm_offset as usize),
-        }
+        counter.start();
     }
     Ok(())
 }
@@ -716,9 +782,9 @@ enum StopCounterErr {
 
 /// Stops a hardware performance counter specified by the offset.
 fn stop_hardware_counter(mhpm_offset: u16, is_reset: bool) -> Result<(), StopCounterErr> {
-    if mhpm_offset == 1 || mhpm_offset > 31 {
+    let Some(counter) = HardwareCounter::try_from_offset(mhpm_offset) else {
         return Err(StopCounterErr::OffsetInvalid);
-    }
+    };
 
     if is_reset && mhpm_offset >= 3 && mhpm_offset <= 31 {
         write_mhpmevent(mhpm_offset, 0);
@@ -728,16 +794,12 @@ fn stop_hardware_counter(mhpm_offset: u16, is_reset: bool) -> Result<(), StopCou
         return Ok(());
     }
 
-    if mcountinhibit::read().bits() & (1 << mhpm_offset) != 0 {
+    if mcountinhibit::read().bits() & counter.inhibit_mask() != 0 {
         return Err(StopCounterErr::AlreadyStop);
     }
 
     unsafe {
-        match mhpm_offset {
-            0 => mcountinhibit::set_cy(),
-            2 => mcountinhibit::set_ir(),
-            _ => mcountinhibit::set_hpm(mhpm_offset as usize),
-        }
+        counter.stop();
     }
     Ok(())
 }
@@ -755,7 +817,9 @@ fn write_mhpmevent(mhpm_offset: u16, mhpmevent_val: u64) {
         seq_macro::seq!(N in 3..=31 {
             match idx {
                 #(
-                    N => pastey::paste!{ [<mhpmevent ~N>]::write(mhpmevent_val as usize) },
+                    N => unsafe {
+                        pastey::paste!{ [<mhpmevent ~N>]::write(mhpmevent_val as usize) }
+                    },
                 )*
                 _ =>{}
             }
@@ -782,7 +846,9 @@ fn write_mhpmcounter(mhpm_offset: u16, mhpmcounter_val: u64) {
         seq_macro::seq!(N in 3..=31 {
             match counter_idx {
                 #(
-                    N => pastey::paste!{ [<mhpmcounter ~N>]::write(mhpmcounter_val as usize) },
+                    N => pastey::paste!{ unsafe {
+                        [<mhpmcounter ~N>]::write(mhpmcounter_val as usize) }
+                    },
                 )*
                 _ =>{}
             }
@@ -863,7 +929,7 @@ impl EventIdx {
     }
 
     #[inline]
-    fn from_firmwarw_event(firmware_event: usize) -> Self {
+    fn from_firmware_event(firmware_event: usize) -> Self {
         Self {
             inner: 0xf << 16 | firmware_event,
         }
@@ -996,7 +1062,7 @@ impl EventToCounterMap {
     }
 
     #[inline]
-    pub fn is_overlop(&self, other_map: &EventToCounterMap) -> bool {
+    pub fn is_overlap(&self, other_map: &EventToCounterMap) -> bool {
         if (self.event_end_idx < other_map.event_start_idx
             && self.event_end_idx < other_map.event_end_idx)
             || (self.event_start_idx > other_map.event_start_idx
@@ -1035,7 +1101,7 @@ impl RawEventToCounterMap {
     }
 
     #[inline]
-    pub const fn is_overlop(&self, other_map: &RawEventToCounterMap) -> bool {
+    pub const fn is_overlap(&self, other_map: &RawEventToCounterMap) -> bool {
         self.select_mask == other_map.select_mask
             && self.raw_event_select == other_map.raw_event_select
     }
@@ -1132,7 +1198,7 @@ pub fn pmu_firmware_counter_increment(firmware_event: usize) {
     for counter_idx in counter_idx_start..counter_idx_start + PMU_FIRMWARE_COUNTER_MAX {
         let fw_idx = counter_idx - counter_idx_start;
         if pmu_state.active_event[counter_idx]
-            == EventIdx::from_firmwarw_event(firmware_event).raw()
+            == EventIdx::from_firmware_event(firmware_event).raw()
             && pmu_state.is_firmware_event_start(counter_idx)
         {
             pmu_state.fw_counter[fw_idx] += 1;

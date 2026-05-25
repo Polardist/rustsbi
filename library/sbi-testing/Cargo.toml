@@ -1,6 +1,6 @@
 [package]
 name = "sbi-testing"
-version = "0.0.3-alpha.2"
+version = "0.0.3"
 description = "Provide a set of test cases for supervisors to verify functions of the supervisor executation environment"
 categories = ["os", "no-std"]
 keywords = ["riscv", "sbi", "rustsbi"]
@@ -18,9 +18,9 @@ default-target = "riscv64imac-unknown-none-elf"
 targets = ["riscv32imac-unknown-none-elf", "riscv64imac-unknown-none-elf"]
 
 [dependencies]
-sbi-rt = { version = "0.0.3", path = "../sbi-rt" }
-sbi-spec = { version = "0.0.8", path = "../sbi-spec" }
-riscv = { version = "0.12.0", default-features = false }
+sbi-rt = { version = "0.0.4", path = "../sbi-rt" }
+sbi-spec = { version = "0.0.9", path = "../sbi-spec" }
+riscv = { workspace = true }
 log = { version = "0.4", package = "log", optional = true }
 
 [features]
